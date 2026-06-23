@@ -1,0 +1,984 @@
+name: Helm SPDX SBOM
+
+on:
+  workflow_dispatch:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: helm-spdx-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PROJECT_DIR: Source
+  SBOM_DIR: sbom/helm
+  ARTIFACT_INPUT_DIR: sbom-input-helm
+  VALIDATION_DIR: validation-results/helm
+  QUALITY_DIR: quality-results/helm
+  VULN_DIR: vulnerability-results/helm
+  DTRACK_DIR: dependency-track-results/helm
+  VEX_DIR: vex/helm
+  BUILD_LOG_DIR: build-logs/helm
+
+jobs:
+  spdx-sbom:
+    name: Build, generate, validate and scan SPDX SBOMs
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Show repository context
+        run: |
+          echo "Repository: $GITHUB_REPOSITORY"
+          echo "Ref: $GITHUB_REF"
+          echo "Commit: $GITHUB_SHA"
+          echo "Project directory: $PROJECT_DIR"
+
+          echo
+          echo "Root directory:"
+          ls -la
+
+          echo
+          echo "Project directory:"
+          ls -la "$PROJECT_DIR"
+
+          echo
+          echo "Detected Go files:"
+          find "$PROJECT_DIR" -maxdepth 3 -type f \( -name "go.mod" -o -name "go.sum" -o -name "Makefile" \) | sort
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: Source/go.mod
+          cache: true
+          cache-dependency-path: Source/go.sum
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Set up Node.js for cdxgen and dep-scan helper tooling
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install base tools
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y jq unzip zip make rsync curl wget git
+
+          mkdir -p \
+            "$SBOM_DIR/source" \
+            "$SBOM_DIR/artifacts" \
+            "$BUILD_LOG_DIR" \
+            "$VALIDATION_DIR" \
+            "$QUALITY_DIR" \
+            "$VULN_DIR/grype" \
+            "$VULN_DIR/trivy" \
+            "$VULN_DIR/github-dependency-review" \
+            "$VULN_DIR/depscan" \
+            "$VULN_DIR/osv-scanner" \
+            "$VULN_DIR/cve-bin-tool" \
+            "$VULN_DIR/sbom-utility" \
+            "$DTRACK_DIR" \
+            "$VEX_DIR"
+
+          echo "Go:"
+          go version
+
+          echo "Python:"
+          python --version
+
+          echo "Node:"
+          node --version
+
+          echo "NPM:"
+          npm --version
+
+          echo "Make:"
+          make --version | head -n 1
+
+      - name: Install Syft
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sudo sh -s -- -b /usr/local/bin
+          syft version | tee "$BUILD_LOG_DIR/syft-version.txt"
+
+      - name: Install Grype
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sudo sh -s -- -b /usr/local/bin
+          grype version | tee "$BUILD_LOG_DIR/grype-version.txt"
+
+      - name: Install Trivy
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sudo sh -s -- -b /usr/local/bin
+          trivy --version | tee "$BUILD_LOG_DIR/trivy-version.txt"
+
+      - name: Install sbomqs
+        run: |
+          go install github.com/interlynk-io/sbomqs@latest
+          sudo cp "$HOME/go/bin/sbomqs" /usr/local/bin/sbomqs
+          sbomqs version || sbomqs --version || true
+
+      - name: Install OSV-Scanner
+        run: |
+          go install github.com/google/osv-scanner/v2/cmd/osv-scanner@latest
+          sudo cp "$HOME/go/bin/osv-scanner" /usr/local/bin/osv-scanner
+          osv-scanner --version | tee "$BUILD_LOG_DIR/osv-scanner-version.txt" || true
+
+      - name: Install cdxgen
+        run: |
+          npm install -g @cyclonedx/cdxgen
+          cdxgen --version | tee "$BUILD_LOG_DIR/cdxgen-version.txt" || true
+
+      - name: Install OWASP dep-scan
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install --user owasp-depscan || true
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+          "$HOME/.local/bin/depscan" --version | tee "$BUILD_LOG_DIR/depscan-version.txt" || true
+
+      - name: Install CVE Binary Tool from main branch
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install --user --upgrade "git+https://github.com/ossf/cve-bin-tool@main"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+          "$HOME/.local/bin/cve-bin-tool" --version | tee "$BUILD_LOG_DIR/cve-bin-tool-version.txt" || true
+
+      - name: Install sbom-utility
+        run: |
+          mkdir -p tools
+
+          SBOM_UTILITY_VERSION=$(curl -s https://api.github.com/repos/CycloneDX/sbom-utility/releases/latest | jq -r '.tag_name')
+          echo "Latest sbom-utility version: $SBOM_UTILITY_VERSION"
+
+          curl -L \
+            "https://github.com/CycloneDX/sbom-utility/releases/download/${SBOM_UTILITY_VERSION}/sbom-utility-${SBOM_UTILITY_VERSION}-linux-amd64.tar.gz" \
+            -o tools/sbom-utility-linux-amd64.tar.gz
+
+          tar -xzf tools/sbom-utility-linux-amd64.tar.gz -C tools
+
+          SBOM_UTILITY_BIN=$(find tools -type f -name "sbom-utility" | head -n 1)
+          chmod +x "$SBOM_UTILITY_BIN"
+          sudo mv "$SBOM_UTILITY_BIN" /usr/local/bin/sbom-utility
+
+          sbom-utility version | tee "$BUILD_LOG_DIR/sbom-utility-version.txt" || true
+
+      - name: Cache CVE Binary Tool data
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/cve-bin-tool
+            ~/.local/share/cve-bin-tool
+          key: cve-bin-tool-data-${{ runner.os }}
+          restore-keys: |
+            cve-bin-tool-data-
+
+      - name: Generate source SPDX SBOM before build with Syft
+        run: |
+          mkdir -p "$SBOM_DIR/source" "$BUILD_LOG_DIR"
+
+          syft dir:"$PROJECT_DIR" \
+            --source-name Helm-Source \
+            --source-version "$GITHUB_SHA" \
+            -o spdx-json="$SBOM_DIR/source/helm.source.syft.spdx.json" \
+            2>&1 | tee "$BUILD_LOG_DIR/source-spdx-syft-generation.log"
+
+      - name: Generate source SPDX SBOM before build with cdxgen
+        continue-on-error: true
+        run: |
+          mkdir -p "$SBOM_DIR/source" "$BUILD_LOG_DIR"
+
+          cdxgen \
+            -t golang \
+            -r \
+            -o "$SBOM_DIR/source/helm.source.cdxgen.spdx.json" \
+            --spec-version 2.3 \
+            --format spdx-json \
+            "$PROJECT_DIR" \
+            2>&1 | tee "$BUILD_LOG_DIR/source-spdx-cdxgen-generation.log" || true
+
+          if [ ! -f "$SBOM_DIR/source/helm.source.cdxgen.spdx.json" ]; then
+            echo '{"status":"skipped_or_failed","reason":"cdxgen did not produce SPDX JSON output"}' > "$SBOM_DIR/source/helm.source.cdxgen.spdx.status.json"
+          fi
+
+      - name: Validate source SPDX SBOM with sbom-utility
+        run: |
+          mkdir -p "$VALIDATION_DIR" "$VULN_DIR/sbom-utility"
+
+          sbom-utility validate \
+            -i "$SBOM_DIR/source/helm.source.syft.spdx.json" \
+            2>&1 | tee "$VALIDATION_DIR/source-syft-spdx-sbom-utility-validation.txt" || true
+
+          if [ -f "$SBOM_DIR/source/helm.source.cdxgen.spdx.json" ]; then
+            sbom-utility validate \
+              -i "$SBOM_DIR/source/helm.source.cdxgen.spdx.json" \
+              2>&1 | tee "$VALIDATION_DIR/source-cdxgen-spdx-sbom-utility-validation.txt" || true
+          else
+            echo "cdxgen SPDX source SBOM not found. Skipping validation." | tee "$VALIDATION_DIR/source-cdxgen-spdx-sbom-utility-validation.txt"
+          fi
+
+      - name: Assess source SPDX SBOM quality with sbomqs
+        run: |
+          mkdir -p "$QUALITY_DIR"
+
+          sbomqs score "$SBOM_DIR/source/helm.source.syft.spdx.json" \
+            2>&1 | tee "$QUALITY_DIR/source-syft-spdx-sbomqs-score.txt"
+
+          sbomqs score "$SBOM_DIR/source/helm.source.syft.spdx.json" --json \
+            > "$QUALITY_DIR/source-syft-spdx-sbomqs-score.json" || true
+
+          if [ -f "$SBOM_DIR/source/helm.source.cdxgen.spdx.json" ]; then
+            sbomqs score "$SBOM_DIR/source/helm.source.cdxgen.spdx.json" \
+              2>&1 | tee "$QUALITY_DIR/source-cdxgen-spdx-sbomqs-score.txt" || true
+
+            sbomqs score "$SBOM_DIR/source/helm.source.cdxgen.spdx.json" --json \
+              > "$QUALITY_DIR/source-cdxgen-spdx-sbomqs-score.json" || true
+          fi
+
+      - name: Build Helm
+        run: |
+          mkdir -p "$BUILD_LOG_DIR"
+
+          cd "$PROJECT_DIR"
+
+          make build \
+            2>&1 | tee "$GITHUB_WORKSPACE/$BUILD_LOG_DIR/helm-build.log"
+
+          echo
+          echo "Built files:"
+          find bin -type f -maxdepth 2 -print | sort | tee "$GITHUB_WORKSPACE/$BUILD_LOG_DIR/helm-built-files.txt"
+
+      - name: Collect Helm build artifacts
+        if: always()
+        run: |
+          rm -rf "$ARTIFACT_INPUT_DIR"
+          mkdir -p "$ARTIFACT_INPUT_DIR" "$BUILD_LOG_DIR"
+
+          echo "Collecting Helm build artifacts..."
+
+          if [ -f "$PROJECT_DIR/bin/helm" ]; then
+            mkdir -p "$ARTIFACT_INPUT_DIR/bin"
+            cp "$PROJECT_DIR/bin/helm" "$ARTIFACT_INPUT_DIR/bin/helm"
+          fi
+
+          find "$PROJECT_DIR" -type f \( \
+            -path "*/bin/helm" -o \
+            -path "*/_dist/*" \
+          \) \
+            -not -path "*/.git/*" \
+            -print | sort | tee "$BUILD_LOG_DIR/collected-artifacts.txt"
+
+          echo
+          echo "Collected artifact input directory:"
+          find "$ARTIFACT_INPUT_DIR" -type f | sort
+
+      - name: Generate artifact SPDX SBOM after build with Syft
+        run: |
+          mkdir -p "$SBOM_DIR/artifacts" "$BUILD_LOG_DIR"
+
+          if [ "$(find "$ARTIFACT_INPUT_DIR" -type f | wc -l)" -gt 0 ]; then
+            syft dir:"$ARTIFACT_INPUT_DIR" \
+              --source-name Helm-Build-Artifacts \
+              --source-version "$GITHUB_SHA" \
+              -o spdx-json="$SBOM_DIR/artifacts/helm.artifacts.syft.spdx.json" \
+              2>&1 | tee "$BUILD_LOG_DIR/artifact-spdx-syft-generation.log"
+          else
+            echo "No build artifacts found. Skipping artifact SPDX SBOM generation." | tee "$BUILD_LOG_DIR/artifact-spdx-syft-generation.log"
+          fi
+
+      - name: Validate artifact SPDX SBOM with sbom-utility
+        run: |
+          mkdir -p "$VALIDATION_DIR"
+
+          if [ -f "$SBOM_DIR/artifacts/helm.artifacts.syft.spdx.json" ]; then
+            sbom-utility validate \
+              -i "$SBOM_DIR/artifacts/helm.artifacts.syft.spdx.json" \
+              2>&1 | tee "$VALIDATION_DIR/artifact-syft-spdx-sbom-utility-validation.txt" || true
+          else
+            echo "Artifact SPDX SBOM not found. Skipping validation." | tee "$VALIDATION_DIR/artifact-syft-spdx-sbom-utility-validation.txt"
+          fi
+
+      - name: Assess artifact SPDX SBOM quality with sbomqs
+        run: |
+          mkdir -p "$QUALITY_DIR"
+
+          if [ -f "$SBOM_DIR/artifacts/helm.artifacts.syft.spdx.json" ]; then
+            sbomqs score "$SBOM_DIR/artifacts/helm.artifacts.syft.spdx.json" \
+              2>&1 | tee "$QUALITY_DIR/artifact-syft-spdx-sbomqs-score.txt"
+
+            sbomqs score "$SBOM_DIR/artifacts/helm.artifacts.syft.spdx.json" --json \
+              > "$QUALITY_DIR/artifact-syft-spdx-sbomqs-score.json" || true
+          else
+            echo "Artifact SPDX SBOM not found. Skipping artifact SBOM quality assessment." | tee "$QUALITY_DIR/artifact-syft-spdx-sbomqs-score.txt"
+          fi
+
+      - name: GitHub Dependency Review
+        if: github.event_name == 'pull_request'
+        continue-on-error: true
+        uses: actions/dependency-review-action@v4
+        with:
+          fail-on-severity: critical
+
+      - name: Record GitHub Dependency Review status
+        if: always()
+        run: |
+          mkdir -p "$VULN_DIR/github-dependency-review"
+
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            echo "GitHub Dependency Review was executed as a pull_request check." > "$VULN_DIR/github-dependency-review/dependency-review-status.txt"
+            echo "Detailed result is available in the GitHub Actions job log and PR checks." >> "$VULN_DIR/github-dependency-review/dependency-review-status.txt"
+          else
+            echo "GitHub Dependency Review skipped because this run is not a pull_request event." > "$VULN_DIR/github-dependency-review/dependency-review-status.txt"
+          fi
+
+          cat "$VULN_DIR/github-dependency-review/dependency-review-status.txt"
+
+      - name: Grype vulnerability scan from source SPDX SBOM
+        run: |
+          mkdir -p "$VULN_DIR/grype"
+
+          grype "sbom:$SBOM_DIR/source/helm.source.syft.spdx.json" \
+            -o json \
+            > "$VULN_DIR/grype/source-syft-spdx-grype.json" || true
+
+          grype "sbom:$SBOM_DIR/source/helm.source.syft.spdx.json" \
+            -o table \
+            2>&1 | tee "$VULN_DIR/grype/source-syft-spdx-grype.table.txt" || true
+
+      - name: Grype vulnerability scan from artifact SPDX SBOM
+        run: |
+          mkdir -p "$VULN_DIR/grype"
+
+          if [ -f "$SBOM_DIR/artifacts/helm.artifacts.syft.spdx.json" ]; then
+            grype "sbom:$SBOM_DIR/artifacts/helm.artifacts.syft.spdx.json" \
+              -o json \
+              > "$VULN_DIR/grype/artifact-syft-spdx-grype.json" || true
+
+            grype "sbom:$SBOM_DIR/artifacts/helm.artifacts.syft.spdx.json" \
+              -o table \
+              2>&1 | tee "$VULN_DIR/grype/artifact-syft-spdx-grype.table.txt" || true
+          else
+            echo '{"matches":[]}' > "$VULN_DIR/grype/artifact-syft-spdx-grype.json"
+            echo "Artifact SPDX SBOM not found. Skipping artifact Grype scan." | tee "$VULN_DIR/grype/artifact-syft-spdx-grype.table.txt"
+          fi
+
+      - name: Trivy filesystem vulnerability scan
+        run: |
+          mkdir -p "$VULN_DIR/trivy"
+
+          trivy fs \
+            --scanners vuln \
+            --format json \
+            --output "$VULN_DIR/trivy/trivy-fs.json" \
+            --exit-code 0 \
+            "$PROJECT_DIR" || true
+
+          trivy fs \
+            --scanners vuln \
+            --format table \
+            --exit-code 0 \
+            "$PROJECT_DIR" \
+            2>&1 | tee "$VULN_DIR/trivy/trivy-fs.table.txt" || true
+
+      - name: Trivy SPDX SBOM vulnerability scan
+        run: |
+          mkdir -p "$VULN_DIR/trivy"
+
+          trivy sbom \
+            --format json \
+            --output "$VULN_DIR/trivy/trivy-source-spdx-sbom.json" \
+            --exit-code 0 \
+            "$SBOM_DIR/source/helm.source.syft.spdx.json" || true
+
+          trivy sbom \
+            --format table \
+            --exit-code 0 \
+            "$SBOM_DIR/source/helm.source.syft.spdx.json" \
+            2>&1 | tee "$VULN_DIR/trivy/trivy-source-spdx-sbom.table.txt" || true
+
+          if [ -f "$SBOM_DIR/artifacts/helm.artifacts.syft.spdx.json" ]; then
+            trivy sbom \
+              --format json \
+              --output "$VULN_DIR/trivy/trivy-artifact-spdx-sbom.json" \
+              --exit-code 0 \
+              "$SBOM_DIR/artifacts/helm.artifacts.syft.spdx.json" || true
+
+            trivy sbom \
+              --format table \
+              --exit-code 0 \
+              "$SBOM_DIR/artifacts/helm.artifacts.syft.spdx.json" \
+              2>&1 | tee "$VULN_DIR/trivy/trivy-artifact-spdx-sbom.table.txt" || true
+          fi
+
+      - name: OWASP dep-scan
+        continue-on-error: true
+        run: |
+          mkdir -p "$VULN_DIR/depscan"
+
+          DEPSCAN_STATUS_FILE="$VULN_DIR/depscan/depscan-status.json"
+
+          if command -v depscan >/dev/null 2>&1; then
+            DEPSCAN_CMD="depscan"
+          elif [ -x "$HOME/.local/bin/depscan" ]; then
+            DEPSCAN_CMD="$HOME/.local/bin/depscan"
+          else
+            echo "depscan command not available. Skipping OWASP dep-scan." | tee "$VULN_DIR/depscan/depscan.log"
+            echo '{"status":"skipped","reason":"depscan command not available"}' > "$DEPSCAN_STATUS_FILE"
+            exit 0
+          fi
+
+          set +e
+          "$DEPSCAN_CMD" \
+            --src "$PROJECT_DIR" \
+            --type go \
+            --reports-dir "$VULN_DIR/depscan" \
+            --report-name helm-depscan \
+            --no-vuln-table \
+            2>&1 | tee "$VULN_DIR/depscan/depscan.log"
+          DEPSCAN_EXIT=${PIPESTATUS[0]}
+          set -e
+
+          if [ "$DEPSCAN_EXIT" -eq 0 ]; then
+            echo '{"status":"success"}' > "$DEPSCAN_STATUS_FILE"
+          else
+            jq -n --arg status "failed" --arg exit_code "$DEPSCAN_EXIT" --arg reason "OWASP dep-scan exited with non-zero code; see depscan.log" \
+              '{status:$status, exit_code:$exit_code, reason:$reason}' > "$DEPSCAN_STATUS_FILE"
+          fi
+
+      - name: OSV-Scanner source scan
+        run: |
+          mkdir -p "$VULN_DIR/osv-scanner"
+
+          osv-scanner scan source \
+            -r "$PROJECT_DIR" \
+            --format json \
+            --output-file "$VULN_DIR/osv-scanner/osv-source.json" \
+            2>&1 | tee "$VULN_DIR/osv-scanner/osv-source-json.log" || true
+
+          osv-scanner scan source \
+            -r "$PROJECT_DIR" \
+            2>&1 | tee "$VULN_DIR/osv-scanner/osv-source.table.txt" || true
+
+      - name: Record OSV-Scanner SBOM mode status
+        run: |
+          mkdir -p "$VULN_DIR/osv-scanner"
+
+          {
+            echo "OSV-Scanner SBOM mode is not used as the primary SPDX result in this workflow."
+            echo "Primary OSV result is produced by OSV-Scanner source mode."
+          } > "$VULN_DIR/osv-scanner/osv-sbom-mode-status.txt"
+
+          echo '{"status":"skipped","reason":"SBOM mode not used; source mode is the primary OSV result"}' > "$VULN_DIR/osv-scanner/osv-sbom-mode-status.json"
+
+      - name: CVE Binary Tool scan on Helm binary
+        timeout-minutes: 45
+        continue-on-error: true
+        env:
+          NVD_API_KEY: ${{ secrets.NVD_API_KEY }}
+        run: |
+          mkdir -p "$VULN_DIR/cve-bin-tool"
+
+          LOG_FILE="$VULN_DIR/cve-bin-tool/cve-bin-tool-artifacts.log"
+          JSON_FILE="$VULN_DIR/cve-bin-tool/cve-bin-tool-artifacts.json"
+          CSV_FILE="$VULN_DIR/cve-bin-tool/cve-bin-tool-artifacts.csv"
+          BINARY_FILE="$ARTIFACT_INPUT_DIR/bin/helm"
+
+          echo "CVE Binary Tool scan started." | tee "$LOG_FILE"
+          echo "Mode: scan built Helm binary artifact." | tee -a "$LOG_FILE"
+          echo "Disabled data sources: OSV,GAD,EPSS to avoid unstable external fetches." | tee -a "$LOG_FILE"
+
+          if [ ! -f "$BINARY_FILE" ]; then
+            echo "Helm binary artifact not found. Skipping CVE Binary Tool scan." | tee -a "$LOG_FILE"
+            echo '{"status":"skipped","reason":"Helm binary artifact not found"}' > "$JSON_FILE"
+            echo "status,reason" > "$CSV_FILE"
+            echo "skipped,Helm binary artifact not found" >> "$CSV_FILE"
+            exit 0
+          fi
+
+          if command -v cve-bin-tool >/dev/null 2>&1; then
+            CVE_BIN_TOOL_CMD="cve-bin-tool"
+          elif [ -x "$HOME/.local/bin/cve-bin-tool" ]; then
+            CVE_BIN_TOOL_CMD="$HOME/.local/bin/cve-bin-tool"
+          else
+            echo "cve-bin-tool command not available. Skipping CVE Binary Tool." | tee -a "$LOG_FILE"
+            echo '{"status":"skipped","reason":"cve-bin-tool command not available"}' > "$JSON_FILE"
+            echo "status,reason" > "$CSV_FILE"
+            echo "skipped,cve-bin-tool command not available" >> "$CSV_FILE"
+            exit 0
+          fi
+
+          COMMON_ARGS=(
+            -d "OSV,GAD,EPSS"
+            --nvd json-mirror
+            --update daily
+            --disable-version-check
+          )
+
+          if [ -n "$NVD_API_KEY" ]; then
+            COMMON_ARGS+=(--nvd-api-key "$NVD_API_KEY")
+          fi
+
+          set +e
+
+          timeout 40m "$CVE_BIN_TOOL_CMD" \
+            "${COMMON_ARGS[@]}" \
+            --format json \
+            --output-file "$JSON_FILE" \
+            "$BINARY_FILE" \
+            2>&1 | tee -a "$LOG_FILE"
+
+          JSON_EXIT=${PIPESTATUS[0]}
+          echo "CVE Binary Tool JSON scan exit code: $JSON_EXIT" | tee -a "$LOG_FILE"
+
+          timeout 40m "$CVE_BIN_TOOL_CMD" \
+            "${COMMON_ARGS[@]}" \
+            --format csv \
+            --output-file "$CSV_FILE" \
+            "$BINARY_FILE" \
+            2>&1 | tee -a "$LOG_FILE"
+
+          CSV_EXIT=${PIPESTATUS[0]}
+          echo "CVE Binary Tool CSV scan exit code: $CSV_EXIT" | tee -a "$LOG_FILE"
+
+          set -e
+
+          if [ ! -f "$JSON_FILE" ]; then
+            jq -n \
+              --arg status "incomplete" \
+              --arg reason "CVE Binary Tool did not complete or produced no JSON output. This scanner is non-blocking." \
+              --arg json_exit "$JSON_EXIT" \
+              --arg csv_exit "$CSV_EXIT" \
+              '{
+                status: $status,
+                reason: $reason,
+                json_exit_code: $json_exit,
+                csv_exit_code: $csv_exit
+              }' > "$JSON_FILE"
+          fi
+
+          if [ ! -f "$CSV_FILE" ]; then
+            echo "status,reason" > "$CSV_FILE"
+            echo "incomplete,CVE Binary Tool did not complete or produced no CSV output" >> "$CSV_FILE"
+          fi
+
+      - name: sbom-utility additional SPDX SBOM analysis
+        run: |
+          mkdir -p "$VULN_DIR/sbom-utility"
+
+          sbom-utility resource list \
+            -i "$SBOM_DIR/source/helm.source.syft.spdx.json" \
+            2>&1 | tee "$VULN_DIR/sbom-utility/source-syft-spdx-resources.txt" || true
+
+          if [ -f "$SBOM_DIR/artifacts/helm.artifacts.syft.spdx.json" ]; then
+            sbom-utility resource list \
+              -i "$SBOM_DIR/artifacts/helm.artifacts.syft.spdx.json" \
+              2>&1 | tee "$VULN_DIR/sbom-utility/artifact-syft-spdx-resources.txt" || true
+          fi
+
+      - name: Generate vulnerability tool summary
+        if: always()
+        run: |
+          mkdir -p "$VULN_DIR"
+
+          status_from_json() {
+            local file="$1"
+            local default_status="$2"
+            if [ -f "$file" ]; then
+              jq -r '.status // empty' "$file" 2>/dev/null | grep -q . && jq -r '.status' "$file" 2>/dev/null || echo "$default_status"
+            else
+              echo "missing"
+            fi
+          }
+
+          exists_status() {
+            local file="$1"
+            if [ -s "$file" ]; then
+              echo "success"
+            else
+              echo "missing"
+            fi
+          }
+
+          GRYPE_SOURCE_TOTAL=$(jq '.matches | length' "$VULN_DIR/grype/source-syft-spdx-grype.json" 2>/dev/null || echo 0)
+          GRYPE_ARTIFACT_TOTAL=$(jq '.matches | length' "$VULN_DIR/grype/artifact-syft-spdx-grype.json" 2>/dev/null || echo 0)
+
+          GRYPE_STATUS=$(exists_status "$VULN_DIR/grype/source-syft-spdx-grype.json")
+          TRIVY_FS_STATUS=$(exists_status "$VULN_DIR/trivy/trivy-fs.json")
+          TRIVY_SOURCE_SBOM_STATUS=$(exists_status "$VULN_DIR/trivy/trivy-source-spdx-sbom.json")
+          TRIVY_ARTIFACT_SBOM_STATUS=$(exists_status "$VULN_DIR/trivy/trivy-artifact-spdx-sbom.json")
+          OSV_SOURCE_STATUS=$(exists_status "$VULN_DIR/osv-scanner/osv-source.json")
+          OSV_SBOM_STATUS=$(status_from_json "$VULN_DIR/osv-scanner/osv-sbom-mode-status.json" "skipped")
+          DEPSCAN_STATUS=$(status_from_json "$VULN_DIR/depscan/depscan-status.json" "completed_or_report_generated")
+          CVE_BINARY_TOOL_STATUS=$(status_from_json "$VULN_DIR/cve-bin-tool/cve-bin-tool-artifacts.json" "completed_or_report_generated")
+
+          if [ -f "$VULN_DIR/github-dependency-review/dependency-review-status.txt" ]; then
+            GITHUB_DEP_REVIEW_STATUS=$(cat "$VULN_DIR/github-dependency-review/dependency-review-status.txt" | head -n 1)
+          else
+            GITHUB_DEP_REVIEW_STATUS="missing"
+          fi
+
+          {
+            echo "# Helm SPDX vulnerability analysis summary"
+            echo
+            echo "Repository: $GITHUB_REPOSITORY"
+            echo "Commit: $GITHUB_SHA"
+            echo
+            echo "## Tool status"
+            echo
+            echo "| Tool | Status | Notes |"
+            echo "|---|---|---|"
+            echo "| Grype | $GRYPE_STATUS | Source findings: $GRYPE_SOURCE_TOTAL, artifact findings: $GRYPE_ARTIFACT_TOTAL |"
+            echo "| Trivy filesystem scan | $TRIVY_FS_STATUS | Broader source tree scan |"
+            echo "| Trivy source SPDX SBOM scan | $TRIVY_SOURCE_SBOM_STATUS | SPDX source SBOM input |"
+            echo "| Trivy artifact SPDX SBOM scan | $TRIVY_ARTIFACT_SBOM_STATUS | SPDX artifact SBOM input |"
+            echo "| GitHub Dependency Review | $GITHUB_DEP_REVIEW_STATUS | Runs only on pull_request events |"
+            echo "| OWASP dep-scan | $DEPSCAN_STATUS | Go source scan |"
+            echo "| OSV-Scanner source mode | $OSV_SOURCE_STATUS | Primary OSV result |"
+            echo "| OSV-Scanner SBOM mode | $OSV_SBOM_STATUS | Not used as primary result |"
+            echo "| CVE Binary Tool | $CVE_BINARY_TOOL_STATUS | Built binary scan; OSV/GAD/EPSS disabled; non-blocking |"
+            echo "| sbom-utility | success_if_validation_files_exist | SPDX validation/inspection, not primary vulnerability scanner |"
+            echo
+            echo "## Tool output directories"
+            echo
+            echo "- Grype: \`$VULN_DIR/grype/\`"
+            echo "- Trivy: \`$VULN_DIR/trivy/\`"
+            echo "- GitHub Dependency Review: \`$VULN_DIR/github-dependency-review/\`"
+            echo "- OWASP dep-scan: \`$VULN_DIR/depscan/\`"
+            echo "- OSV-Scanner: \`$VULN_DIR/osv-scanner/\`"
+            echo "- CVE Binary Tool: \`$VULN_DIR/cve-bin-tool/\`"
+            echo "- sbom-utility: \`$VULN_DIR/sbom-utility/\`"
+            echo
+            echo "## Notes"
+            echo
+            echo "- Build and SPDX SBOM generation are treated as core lifecycle checks."
+            echo "- Vulnerability scanners run in report-only/non-blocking mode where external databases may be unstable."
+            echo "- Dependency-Track upload is conditional on secrets being configured."
+            echo "- VEX output is under_investigation and does not claim affected/not_affected status."
+          } > "$VULN_DIR/vulnerability-summary.md"
+
+          cat "$VULN_DIR/vulnerability-summary.md"
+
+      - name: Upload artifact SPDX SBOM to Dependency-Track if configured
+        if: always()
+        env:
+          DTRACK_BASE_URL: ${{ secrets.DTRACK_BASE_URL }}
+          DTRACK_API_KEY: ${{ secrets.DTRACK_API_KEY }}
+          DTRACK_PROJECT_UUID: ${{ secrets.DTRACK_PROJECT_UUID }}
+          DTRACK_PROJECT_NAME: ${{ secrets.DTRACK_PROJECT_NAME }}
+          DTRACK_PROJECT_VERSION: ${{ secrets.DTRACK_PROJECT_VERSION }}
+        run: |
+          mkdir -p "$DTRACK_DIR"
+
+          SBOM_FILE="$SBOM_DIR/artifacts/helm.artifacts.syft.spdx.json"
+
+          if [ -z "$DTRACK_BASE_URL" ] || [ -z "$DTRACK_API_KEY" ]; then
+            echo "Dependency-Track base URL or API key is not configured. Skipping upload." | tee "$DTRACK_DIR/dependency-track-upload.log"
+            echo "Required secrets: DTRACK_BASE_URL, DTRACK_API_KEY." | tee -a "$DTRACK_DIR/dependency-track-upload.log"
+            echo "Optional mode A: DTRACK_PROJECT_UUID." | tee -a "$DTRACK_DIR/dependency-track-upload.log"
+            echo "Optional mode B: DTRACK_PROJECT_NAME, DTRACK_PROJECT_VERSION with autoCreate=true." | tee -a "$DTRACK_DIR/dependency-track-upload.log"
+            exit 0
+          fi
+
+          if [ ! -f "$SBOM_FILE" ]; then
+            echo "Artifact SPDX SBOM not found. Skipping Dependency-Track upload." | tee "$DTRACK_DIR/dependency-track-upload.log"
+            exit 0
+          fi
+
+          echo "Uploading artifact SPDX SBOM to Dependency-Track..." | tee "$DTRACK_DIR/dependency-track-upload.log"
+
+          if [ -n "$DTRACK_PROJECT_UUID" ]; then
+            HTTP_CODE=$(curl -sS -o "$DTRACK_DIR/dependency-track-response.json" -w "%{http_code}" \
+              -X POST "$DTRACK_BASE_URL/api/v1/bom" \
+              -H "X-Api-Key: $DTRACK_API_KEY" \
+              -F "project=$DTRACK_PROJECT_UUID" \
+              -F "bom=@$SBOM_FILE")
+          else
+            PROJECT_NAME="${DTRACK_PROJECT_NAME:-Helm}"
+            PROJECT_VERSION="${DTRACK_PROJECT_VERSION:-$GITHUB_SHA}"
+
+            HTTP_CODE=$(curl -sS -o "$DTRACK_DIR/dependency-track-response.json" -w "%{http_code}" \
+              -X POST "$DTRACK_BASE_URL/api/v1/bom" \
+              -H "X-Api-Key: $DTRACK_API_KEY" \
+              -F "autoCreate=true" \
+              -F "projectName=$PROJECT_NAME" \
+              -F "projectVersion=$PROJECT_VERSION" \
+              -F "bom=@$SBOM_FILE")
+          fi
+
+          echo "Dependency-Track HTTP status: $HTTP_CODE" | tee -a "$DTRACK_DIR/dependency-track-upload.log"
+
+          if [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 300 ]; then
+            echo "Dependency-Track upload completed successfully." | tee -a "$DTRACK_DIR/dependency-track-upload.log"
+          else
+            echo "Dependency-Track upload failed or was not accepted." | tee -a "$DTRACK_DIR/dependency-track-upload.log"
+            cat "$DTRACK_DIR/dependency-track-response.json" || true
+            exit 0
+          fi
+
+      - name: Produce OpenVEX document from Grype findings
+        if: always()
+        run: |
+          mkdir -p "$VEX_DIR"
+
+          PRODUCT_ID="pkg:generic/helm@${GITHUB_SHA}"
+          VEX_TIMESTAMP="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          VEX_ID="https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/openvex/helm"
+
+          jq -n \
+            --arg id "$VEX_ID" \
+            --arg author "GitHub Actions" \
+            --arg timestamp "$VEX_TIMESTAMP" \
+            --arg product "$PRODUCT_ID" \
+            --slurpfile src "$VULN_DIR/grype/source-syft-spdx-grype.json" \
+            --slurpfile art "$VULN_DIR/grype/artifact-syft-spdx-grype.json" '
+            {
+              "@context": "https://openvex.dev/ns/v0.2.0",
+              "@id": $id,
+              "author": $author,
+              "timestamp": $timestamp,
+              "version": 1,
+              "statements": (
+                (
+                  (($src[0].matches // []) + ($art[0].matches // []))
+                  | map(.vulnerability.id)
+                  | unique
+                  | .[0:50]
+                  | map({
+                      "vulnerability": {"name": .},
+                      "timestamp": $timestamp,
+                      "products": [{"@id": $product}],
+                      "status": "under_investigation",
+                      "impact_statement": "Automatically generated OpenVEX placeholder from Grype findings. Vulnerability requires manual exploitability assessment before affected/not_affected status can be assigned."
+                    })
+                )
+              )
+            }' > "$VEX_DIR/helm.openvex.json"
+
+          echo "# Helm OpenVEX summary" > "$VEX_DIR/vex-summary.md"
+          echo >> "$VEX_DIR/vex-summary.md"
+          echo "OpenVEX file: \`$VEX_DIR/helm.openvex.json\`" >> "$VEX_DIR/vex-summary.md"
+          echo >> "$VEX_DIR/vex-summary.md"
+          echo "Generated statements:" >> "$VEX_DIR/vex-summary.md"
+          jq '.statements | length' "$VEX_DIR/helm.openvex.json" >> "$VEX_DIR/vex-summary.md"
+          echo >> "$VEX_DIR/vex-summary.md"
+          echo "Default status: \`under_investigation\`" >> "$VEX_DIR/vex-summary.md"
+          echo >> "$VEX_DIR/vex-summary.md"
+          echo "Reason: automatic workflow cannot honestly mark findings as affected or not_affected without manual exploitability analysis." >> "$VEX_DIR/vex-summary.md"
+
+          cat "$VEX_DIR/vex-summary.md"
+
+      - name: Check OpenVEX document structure
+        if: always()
+        run: |
+          VEX_FILE="$VEX_DIR/helm.openvex.json"
+
+          jq -e '
+            .["@context"] == "https://openvex.dev/ns/v0.2.0"
+            and (.["@id"] | type == "string")
+            and (.author | type == "string")
+            and (.timestamp | type == "string")
+            and (.version | type == "number")
+            and (.statements | type == "array")
+            and all(.statements[]?;
+              (.vulnerability.name | type == "string")
+              and (.timestamp | type == "string")
+              and (.products | type == "array")
+              and (.status | IN("not_affected", "affected", "fixed", "under_investigation"))
+            )
+          ' "$VEX_FILE" \
+            2>&1 | tee "$VEX_DIR/openvex-structure-check.log"
+
+      - name: Generate traceability manifest
+        if: always()
+        run: |
+          mkdir -p "$SBOM_DIR"
+
+          jq -n \
+            --arg repository "$GITHUB_REPOSITORY" \
+            --arg ref "$GITHUB_REF" \
+            --arg commit "$GITHUB_SHA" \
+            --arg run_id "$GITHUB_RUN_ID" \
+            --arg run_attempt "$GITHUB_RUN_ATTEMPT" \
+            --arg project_dir "$PROJECT_DIR" \
+            --arg source_sbom "$SBOM_DIR/source/helm.source.syft.spdx.json" \
+            --arg artifact_sbom "$SBOM_DIR/artifacts/helm.artifacts.syft.spdx.json" \
+            --arg vuln_summary "$VULN_DIR/vulnerability-summary.md" \
+            --arg dtrack "$DTRACK_DIR/dependency-track-upload.log" \
+            --arg vex "$VEX_DIR/helm.openvex.json" \
+            '{
+              repository: $repository,
+              ref: $ref,
+              commit: $commit,
+              workflow_run_id: $run_id,
+              workflow_run_attempt: $run_attempt,
+              project_directory: $project_dir,
+              lifecycle: {
+                build: "make build",
+                source_sbom_generation: "Syft SPDX JSON before build",
+                artifact_sbom_generation: "Syft SPDX JSON after build",
+                schema_validation: "sbom-utility SPDX validation",
+                quality_assessment: "sbomqs",
+                vulnerability_analysis: [
+                  "Grype",
+                  "Trivy",
+                  "GitHub Dependency Review",
+                  "OWASP dep-scan",
+                  "OSV-Scanner",
+                  "CVE Binary Tool",
+                  "sbom-utility"
+                ],
+                tracking: "Dependency-Track optional upload",
+                vex: "OpenVEX generated from Grype findings"
+              },
+              artifacts: {
+                source_spdx_sbom: $source_sbom,
+                artifact_spdx_sbom: $artifact_sbom,
+                vulnerability_summary: $vuln_summary,
+                dependency_track_upload_log: $dtrack,
+                vex: $vex
+              }
+            }' > "$SBOM_DIR/manifest.json"
+
+          cat "$SBOM_DIR/manifest.json"
+
+      - name: Generate final summary
+        if: always()
+        run: |
+          mkdir -p "$SBOM_DIR"
+
+          {
+            echo "# Helm SPDX SBOM summary"
+            echo
+            echo "Repository: $GITHUB_REPOSITORY"
+            echo "Ref: $GITHUB_REF"
+            echo "Commit: $GITHUB_SHA"
+            echo "Project directory: $PROJECT_DIR"
+            echo
+            echo "## Lifecycle stage"
+            echo
+            echo "Current milestone: source SPDX SBOM + artifact SPDX SBOM + validation + quality assessment + artifact storage + multi-tool vulnerability analysis + Dependency-Track optional upload + OpenVEX generation"
+            echo
+            echo "## Tooling"
+            echo
+            echo "- Build: make build"
+            echo "- Source SBOM generation: Syft SPDX JSON"
+            echo "- Additional source SBOM generation: cdxgen SPDX JSON, best-effort"
+            echo "- Artifact SBOM generation: Syft SPDX JSON"
+            echo "- SPDX validation/inspection: sbom-utility"
+            echo "- SBOM quality assessment: sbomqs"
+            echo "- Artifact storage: actions/upload-artifact@v4"
+            echo "- Vulnerability analysis: Grype"
+            echo "- Vulnerability analysis: Trivy"
+            echo "- Vulnerability analysis: GitHub Dependency Review"
+            echo "- Vulnerability analysis: OWASP dep-scan"
+            echo "- Vulnerability analysis: OSV-Scanner"
+            echo "- Vulnerability analysis: CVE Binary Tool"
+            echo "- Store, scan and track: Dependency-Track optional upload"
+            echo "- VEX: OpenVEX generated from Grype findings"
+            echo "- SBOM standard: SPDX"
+            echo "- Output format: JSON"
+            echo
+            echo "## Generated source SPDX SBOM files"
+            if [ -d "$SBOM_DIR/source" ]; then
+              find "$SBOM_DIR/source" -type f | sort | while read file; do
+                size=$(wc -c < "$file")
+                echo "- \`$file\` (${size} bytes)"
+              done
+            else
+              echo "- No source SPDX SBOM files generated"
+            fi
+            echo
+            echo "## Generated artifact SPDX SBOM files"
+            if [ -d "$SBOM_DIR/artifacts" ]; then
+              find "$SBOM_DIR/artifacts" -type f | sort | while read file; do
+                size=$(wc -c < "$file")
+                echo "- \`$file\` (${size} bytes)"
+              done
+            else
+              echo "- No artifact SPDX SBOM files generated"
+            fi
+            echo
+            echo "## Validation results"
+            if [ -d "$VALIDATION_DIR" ]; then
+              find "$VALIDATION_DIR" -type f | sort | while read file; do
+                size=$(wc -c < "$file")
+                echo "- \`$file\` (${size} bytes)"
+              done
+            else
+              echo "- No validation results generated"
+            fi
+            echo
+            echo "## Quality results"
+            if [ -d "$QUALITY_DIR" ]; then
+              find "$QUALITY_DIR" -type f | sort | while read file; do
+                size=$(wc -c < "$file")
+                echo "- \`$file\` (${size} bytes)"
+              done
+            else
+              echo "- No quality results generated"
+            fi
+            echo
+            echo "## Vulnerability results"
+            if [ -d "$VULN_DIR" ]; then
+              find "$VULN_DIR" -type f | sort | while read file; do
+                size=$(wc -c < "$file")
+                echo "- \`$file\` (${size} bytes)"
+              done
+            else
+              echo "- No vulnerability results generated"
+            fi
+            echo
+            echo "## Dependency-Track results"
+            if [ -d "$DTRACK_DIR" ]; then
+              find "$DTRACK_DIR" -type f | sort | while read file; do
+                size=$(wc -c < "$file")
+                echo "- \`$file\` (${size} bytes)"
+              done
+            else
+              echo "- No Dependency-Track results generated"
+            fi
+            echo
+            echo "## VEX results"
+            if [ -d "$VEX_DIR" ]; then
+              find "$VEX_DIR" -type f | sort | while read file; do
+                size=$(wc -c < "$file")
+                echo "- \`$file\` (${size} bytes)"
+              done
+            else
+              echo "- No VEX results generated"
+            fi
+            echo
+            echo "## Collected build artifacts"
+            if [ -f "$BUILD_LOG_DIR/collected-artifacts.txt" ]; then
+              echo "- Count: $(wc -l < "$BUILD_LOG_DIR/collected-artifacts.txt")"
+            else
+              echo "- Count: unavailable"
+            fi
+          } > "$SBOM_DIR/summary.md"
+
+          cat "$SBOM_DIR/summary.md"
+
+      - name: Upload full Helm SPDX SBOM lifecycle results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: helm-spdx-sbom-lifecycle-results
+          path: |
+            sbom/helm/
+            build-logs/helm/
+            validation-results/helm/
+            quality-results/helm/
+            vulnerability-results/helm/
+            dependency-track-results/helm/
+            vex/helm/
+            sbom-input-helm/
