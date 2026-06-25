@@ -471,6 +471,8 @@ jobs:
 
           if [ -n "$NVD_API_KEY" ]; then
             COMMON_ARGS+=(--nvdApiKey "$NVD_API_KEY")
+          else
+            COMMON_ARGS+=(--nvdApiDelay 16000)
           fi
 
           set +e
