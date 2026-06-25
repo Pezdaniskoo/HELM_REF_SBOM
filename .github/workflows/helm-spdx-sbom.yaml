@@ -83,6 +83,7 @@ jobs:
             "$QUALITY_DIR" \
             "$VULN_DIR/grype" \
             "$VULN_DIR/trivy" \
+            "$VULN_DIR/dependency-check" \
             "$VULN_DIR/github-dependency-review" \
             "$VULN_DIR/depscan" \
             "$VULN_DIR/osv-scanner" \
@@ -173,6 +174,29 @@ jobs:
 
           sbom-utility version | tee "$BUILD_LOG_DIR/sbom-utility-version.txt" || true
 
+      - name: Install OWASP Dependency-Check
+        run: |
+          mkdir -p tools "$BUILD_LOG_DIR"
+
+          DC_VERSION="12.1.0"
+
+          curl -L \
+            "https://github.com/dependency-check/DependencyCheck/releases/download/v${DC_VERSION}/dependency-check-${DC_VERSION}-release.zip" \
+            -o tools/dependency-check.zip
+
+          unzip -q tools/dependency-check.zip -d tools
+          chmod +x tools/dependency-check/bin/dependency-check.sh
+
+          tools/dependency-check/bin/dependency-check.sh --version | tee "$BUILD_LOG_DIR/dependency-check-version.txt" || true
+
+      - name: Cache OWASP Dependency-Check data
+        uses: actions/cache@v4
+        with:
+          path: ~/.dependency-check-data
+          key: dependency-check-data-${{ runner.os }}
+          restore-keys: |
+            dependency-check-data-
+
       - name: Cache CVE Binary Tool data
         uses: actions/cache@v4
         with:
@@ -256,7 +280,7 @@ jobs:
 
           echo
           echo "Built files:"
-          find bin -type f -maxdepth 2 -print | sort | tee "$GITHUB_WORKSPACE/$BUILD_LOG_DIR/helm-built-files.txt"
+          find bin -maxdepth 2 -type f -print | sort | tee "$GITHUB_WORKSPACE/$BUILD_LOG_DIR/helm-built-files.txt"
 
       - name: Collect Helm build artifacts
         if: always()
@@ -418,6 +442,52 @@ jobs:
               --exit-code 0 \
               "$SBOM_DIR/artifacts/helm.artifacts.syft.spdx.json" \
               2>&1 | tee "$VULN_DIR/trivy/trivy-artifact-spdx-sbom.table.txt" || true
+          fi
+
+      - name: OWASP Dependency-Check scan
+        continue-on-error: true
+        env:
+          NVD_API_KEY: ${{ secrets.NVD_API_KEY }}
+        run: |
+          mkdir -p "$VULN_DIR/dependency-check"
+
+          DC_CMD="tools/dependency-check/bin/dependency-check.sh"
+          DC_STATUS_FILE="$VULN_DIR/dependency-check/dependency-check-status.json"
+
+          if [ ! -x "$DC_CMD" ]; then
+            echo "Dependency-Check command not available. Skipping." | tee "$VULN_DIR/dependency-check/dependency-check.log"
+            echo '{"status":"skipped","reason":"Dependency-Check command not available"}' > "$DC_STATUS_FILE"
+            exit 0
+          fi
+
+          COMMON_ARGS=(
+            --project "Helm"
+            --scan "$PROJECT_DIR"
+            --out "$VULN_DIR/dependency-check"
+            --format "ALL"
+            --data "$HOME/.dependency-check-data"
+            --failOnCVSS 11
+          )
+
+          if [ -n "$NVD_API_KEY" ]; then
+            COMMON_ARGS+=(--nvdApiKey "$NVD_API_KEY")
+          fi
+
+          set +e
+          "$DC_CMD" "${COMMON_ARGS[@]}" \
+            2>&1 | tee "$VULN_DIR/dependency-check/dependency-check.log"
+          DC_EXIT=${PIPESTATUS[0]}
+          set -e
+
+          if [ "$DC_EXIT" -eq 0 ]; then
+            echo '{"status":"success"}' > "$DC_STATUS_FILE"
+          else
+            jq -n \
+              --arg status "failed" \
+              --arg exit_code "$DC_EXIT" \
+              --arg reason "Dependency-Check exited with non-zero code. NVD_API_KEY is recommended for stable execution." \
+              '{status:$status, exit_code:$exit_code, reason:$reason}' \
+              > "$DC_STATUS_FILE"
           fi
 
       - name: OWASP dep-scan
@@ -616,6 +686,7 @@ jobs:
           TRIVY_FS_STATUS=$(exists_status "$VULN_DIR/trivy/trivy-fs.json")
           TRIVY_SOURCE_SBOM_STATUS=$(exists_status "$VULN_DIR/trivy/trivy-source-spdx-sbom.json")
           TRIVY_ARTIFACT_SBOM_STATUS=$(exists_status "$VULN_DIR/trivy/trivy-artifact-spdx-sbom.json")
+          DEPENDENCY_CHECK_STATUS=$(status_from_json "$VULN_DIR/dependency-check/dependency-check-status.json" "completed_or_report_generated")
           OSV_SOURCE_STATUS=$(exists_status "$VULN_DIR/osv-scanner/osv-source.json")
           OSV_SBOM_STATUS=$(status_from_json "$VULN_DIR/osv-scanner/osv-sbom-mode-status.json" "skipped")
           DEPSCAN_STATUS=$(status_from_json "$VULN_DIR/depscan/depscan-status.json" "completed_or_report_generated")
@@ -641,6 +712,7 @@ jobs:
             echo "| Trivy filesystem scan | $TRIVY_FS_STATUS | Broader source tree scan |"
             echo "| Trivy source SPDX SBOM scan | $TRIVY_SOURCE_SBOM_STATUS | SPDX source SBOM input |"
             echo "| Trivy artifact SPDX SBOM scan | $TRIVY_ARTIFACT_SBOM_STATUS | SPDX artifact SBOM input |"
+            echo "| OWASP Dependency-Check | $DEPENDENCY_CHECK_STATUS | Filesystem scan; NVD_API_KEY recommended |"
             echo "| GitHub Dependency Review | $GITHUB_DEP_REVIEW_STATUS | Runs only on pull_request events |"
             echo "| OWASP dep-scan | $DEPSCAN_STATUS | Go source scan |"
             echo "| OSV-Scanner source mode | $OSV_SOURCE_STATUS | Primary OSV result |"
@@ -652,6 +724,7 @@ jobs:
             echo
             echo "- Grype: \`$VULN_DIR/grype/\`"
             echo "- Trivy: \`$VULN_DIR/trivy/\`"
+            echo "- OWASP Dependency-Check: \`$VULN_DIR/dependency-check/\`"
             echo "- GitHub Dependency Review: \`$VULN_DIR/github-dependency-review/\`"
             echo "- OWASP dep-scan: \`$VULN_DIR/depscan/\`"
             echo "- OSV-Scanner: \`$VULN_DIR/osv-scanner/\`"
@@ -831,6 +904,7 @@ jobs:
                 vulnerability_analysis: [
                   "Grype",
                   "Trivy",
+                  "OWASP Dependency-Check",
                   "GitHub Dependency Review",
                   "OWASP dep-scan",
                   "OSV-Scanner",
@@ -879,6 +953,7 @@ jobs:
             echo "- Artifact storage: actions/upload-artifact@v4"
             echo "- Vulnerability analysis: Grype"
             echo "- Vulnerability analysis: Trivy"
+            echo "- Vulnerability analysis: OWASP Dependency-Check"
             echo "- Vulnerability analysis: GitHub Dependency Review"
             echo "- Vulnerability analysis: OWASP dep-scan"
             echo "- Vulnerability analysis: OSV-Scanner"
