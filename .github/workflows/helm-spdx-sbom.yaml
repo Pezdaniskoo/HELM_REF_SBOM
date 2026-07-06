@@ -108,32 +108,57 @@ jobs:
           syft version | tee "$BUILD_LOG_DIR/syft-version.txt"
 
       - name: Install bom
+        continue-on-error: true
         run: |
+          mkdir -p "$BUILD_LOG_DIR"
+
+          set +e
           go install sigs.k8s.io/bom/cmd/bom@latest
-          sudo cp "$HOME/go/bin/bom" /usr/local/bin/bom
-          bom version 2>&1 | tee "$BUILD_LOG_DIR/bom-version.txt" || true
+          BOM_INSTALL_EXIT=$?
+          set -e
+
+          if [ "$BOM_INSTALL_EXIT" -eq 0 ] && [ -x "$HOME/go/bin/bom" ]; then
+            sudo cp "$HOME/go/bin/bom" /usr/local/bin/bom
+            bom version 2>&1 | tee "$BUILD_LOG_DIR/bom-version.txt" || true
+            echo '{"status":"success","method":"go install"}' > "$BUILD_LOG_DIR/bom-install-status.json"
+          else
+            echo "bom installation failed. This tool will be skipped later." | tee "$BUILD_LOG_DIR/bom-version.txt"
+            echo '{"status":"failed","reason":"go install failed; Syft remains the primary SPDX generator"}' > "$BUILD_LOG_DIR/bom-install-status.json"
+          fi
 
       - name: Install spdx-sbom-generator
+        continue-on-error: true
         run: |
-          mkdir -p tools
+          mkdir -p "$BUILD_LOG_DIR"
 
-          GENERATOR_VERSION=$(curl -s https://api.github.com/repos/opensbom-generator/spdx-sbom-generator/releases/latest | jq -r '.tag_name')
-          echo "Latest spdx-sbom-generator version: $GENERATOR_VERSION"
+          echo "Installing spdx-sbom-generator with go install..."
 
-          curl -L \
-            "https://github.com/opensbom-generator/spdx-sbom-generator/releases/download/${GENERATOR_VERSION}/spdx-sbom-generator-${GENERATOR_VERSION#v}-linux-amd64.tar.gz" \
-            -o tools/spdx-sbom-generator.tar.gz
+          set +e
+          go install github.com/opensbom-generator/spdx-sbom-generator@latest
+          INSTALL_EXIT=$?
+          set -e
 
-          tar -xzf tools/spdx-sbom-generator.tar.gz -C tools
+          if [ "$INSTALL_EXIT" -eq 0 ] && [ -x "$HOME/go/bin/spdx-sbom-generator" ]; then
+            sudo cp "$HOME/go/bin/spdx-sbom-generator" /usr/local/bin/spdx-sbom-generator
 
-          SPDX_GENERATOR_BIN=$(find tools -type f -name "spdx-sbom-generator" | head -n 1)
-          chmod +x "$SPDX_GENERATOR_BIN"
-          sudo mv "$SPDX_GENERATOR_BIN" /usr/local/bin/spdx-sbom-generator
+            spdx-sbom-generator --version \
+              2>&1 | tee "$BUILD_LOG_DIR/spdx-sbom-generator-version.txt" || true
 
-          spdx-sbom-generator --version 2>&1 | tee "$BUILD_LOG_DIR/spdx-sbom-generator-version.txt" || true
+            echo '{"status":"success","method":"go install"}' \
+              > "$BUILD_LOG_DIR/spdx-sbom-generator-install-status.json"
+          else
+            echo "spdx-sbom-generator installation failed. This tool will be skipped later." \
+              | tee "$BUILD_LOG_DIR/spdx-sbom-generator-version.txt"
+
+            echo '{"status":"failed","reason":"go install failed; Syft remains the primary SPDX generator"}' \
+              > "$BUILD_LOG_DIR/spdx-sbom-generator-install-status.json"
+          fi
 
       - name: Install SPDX tools and NTIA checker
+        continue-on-error: true
         run: |
+          mkdir -p "$BUILD_LOG_DIR"
+
           python -m pip install --upgrade pip
 
           python -m pip install --user spdx-tools || true
@@ -150,22 +175,26 @@ jobs:
           sbomqs version 2>&1 | tee "$BUILD_LOG_DIR/sbomqs-version.txt" || true
 
       - name: Install sbom-scorecard
+        continue-on-error: true
         run: |
           npm install -g sbom-scorecard || true
           sbom-scorecard --version 2>&1 | tee "$BUILD_LOG_DIR/sbom-scorecard-version.txt" || true
 
       - name: Install Cosign
+        continue-on-error: true
         run: |
           curl -sSfL https://raw.githubusercontent.com/sigstore/cosign/main/install.sh | sudo sh -s -- -b /usr/local/bin
           cosign version 2>&1 | tee "$BUILD_LOG_DIR/cosign-version.txt" || true
 
       - name: Install vexctl
+        continue-on-error: true
         run: |
           go install github.com/openvex/vexctl@latest
           sudo cp "$HOME/go/bin/vexctl" /usr/local/bin/vexctl
           vexctl version 2>&1 | tee "$BUILD_LOG_DIR/vexctl-version.txt" || true
 
       - name: Install CSAF tools
+        continue-on-error: true
         run: |
           npm install -g @csaf/csaf-validator-lib @csaf/csaf-cli || true
           csaf --version 2>&1 | tee "$BUILD_LOG_DIR/csaf-version.txt" || true
@@ -209,6 +238,16 @@ jobs:
         run: |
           mkdir -p "$SBOM_DIR/source"
 
+          if ! command -v bom >/dev/null 2>&1; then
+            echo "bom command not available. Skipping." \
+              | tee "$BUILD_LOG_DIR/source-spdx-bom-generation.log"
+
+            echo '{"status":"skipped","reason":"bom command not available"}' \
+              > "$SBOM_DIR/source/bom-status.json"
+
+            exit 0
+          fi
+
           set +e
           bom generate \
             -d "$PROJECT_DIR" \
@@ -228,6 +267,16 @@ jobs:
         run: |
           mkdir -p "$SBOM_DIR/source"
 
+          if ! command -v spdx-sbom-generator >/dev/null 2>&1; then
+            echo "spdx-sbom-generator command not available. Skipping." \
+              | tee "$BUILD_LOG_DIR/source-spdx-generator-generation.log"
+
+            echo '{"status":"skipped","reason":"spdx-sbom-generator command not available"}' \
+              > "$SBOM_DIR/source/spdx-sbom-generator-status.json"
+
+            exit 0
+          fi
+
           set +e
           (
             cd "$PROJECT_DIR"
@@ -244,7 +293,8 @@ jobs:
             cp "$GENERATED_FILE" "$SBOM_DIR/source/helm.source.spdx-sbom-generator.spdx.json" || true
             echo '{"status":"success"}' > "$SBOM_DIR/source/spdx-sbom-generator-status.json"
           else
-            echo '{"status":"failed","reason":"spdx-sbom-generator did not produce output; see log"}' > "$SBOM_DIR/source/spdx-sbom-generator-status.json"
+            echo '{"status":"failed","reason":"spdx-sbom-generator did not produce output; see log"}' \
+              > "$SBOM_DIR/source/spdx-sbom-generator-status.json"
           fi
 
       - name: Export GitHub SBOM if available
@@ -271,6 +321,7 @@ jobs:
           fi
 
       - name: Generate artifact SPDX SBOM with Syft
+        if: always()
         run: |
           mkdir -p "$SBOM_DIR/artifacts"
 
@@ -285,22 +336,54 @@ jobs:
           fi
 
       - name: Validate source SPDX SBOM with SPDX tools
+        if: always()
+        continue-on-error: true
         run: |
           mkdir -p "$VALIDATION_DIR"
 
           SPDX_FILE="$SBOM_DIR/source/helm.source.syft.spdx.json"
 
-          python -m spdx_tools.spdx3.bump_from_spdx2 "$SPDX_FILE" \
-            > "$VALIDATION_DIR/source-spdx-tools-validation.txt" \
-            2>&1 || true
-
-          if [ -s "$VALIDATION_DIR/source-spdx-tools-validation.txt" ]; then
-            cat "$VALIDATION_DIR/source-spdx-tools-validation.txt"
-          else
-            echo "SPDX tools command completed or produced no output." | tee "$VALIDATION_DIR/source-spdx-tools-validation.txt"
+          if [ ! -f "$SPDX_FILE" ]; then
+            echo "Source SPDX SBOM not found. Skipping validation." | tee "$VALIDATION_DIR/source-spdx-tools-validation.txt"
+            exit 0
           fi
 
+          python - <<'PY' "$SPDX_FILE" "$VALIDATION_DIR/source-spdx-tools-validation.txt"
+          import json
+          import sys
+          from pathlib import Path
+
+          sbom_path = Path(sys.argv[1])
+          out_path = Path(sys.argv[2])
+
+          try:
+              data = json.loads(sbom_path.read_text())
+              required = ["spdxVersion", "SPDXID", "name", "creationInfo", "packages"]
+              missing = [key for key in required if key not in data]
+
+              lines = []
+              lines.append(f"File: {sbom_path}")
+              lines.append("Validation type: basic SPDX JSON structure check")
+              lines.append(f"SPDX version: {data.get('spdxVersion', 'missing')}")
+              lines.append(f"Packages: {len(data.get('packages', []))}")
+
+              if missing:
+                  lines.append(f"Status: failed")
+                  lines.append(f"Missing required fields: {', '.join(missing)}")
+              else:
+                  lines.append("Status: success")
+
+              out_path.write_text("\n".join(lines) + "\n")
+              print(out_path.read_text())
+              sys.exit(1 if missing else 0)
+          except Exception as exc:
+              out_path.write_text(f"Status: failed\nReason: {exc}\n")
+              print(out_path.read_text())
+              sys.exit(1)
+          PY
+
       - name: Validate source SPDX SBOM with NTIA conformance checker
+        if: always()
         continue-on-error: true
         run: |
           mkdir -p "$VALIDATION_DIR"
@@ -323,35 +406,70 @@ jobs:
 
       - name: Validate artifact SPDX SBOM
         if: always()
+        continue-on-error: true
         run: |
           mkdir -p "$VALIDATION_DIR"
 
-          if [ -f "$SBOM_DIR/artifacts/helm.artifacts.syft.spdx.json" ]; then
-            python -m spdx_tools.spdx3.bump_from_spdx2 "$SBOM_DIR/artifacts/helm.artifacts.syft.spdx.json" \
-              > "$VALIDATION_DIR/artifact-spdx-tools-validation.txt" \
-              2>&1 || true
+          SPDX_FILE="$SBOM_DIR/artifacts/helm.artifacts.syft.spdx.json"
 
-            if [ -s "$VALIDATION_DIR/artifact-spdx-tools-validation.txt" ]; then
-              cat "$VALIDATION_DIR/artifact-spdx-tools-validation.txt"
-            else
-              echo "SPDX tools command completed or produced no output." | tee "$VALIDATION_DIR/artifact-spdx-tools-validation.txt"
-            fi
-          else
+          if [ ! -f "$SPDX_FILE" ]; then
             echo "Artifact SPDX SBOM not found. Skipping validation." | tee "$VALIDATION_DIR/artifact-spdx-tools-validation.txt"
+            exit 0
           fi
 
+          python - <<'PY' "$SPDX_FILE" "$VALIDATION_DIR/artifact-spdx-tools-validation.txt"
+          import json
+          import sys
+          from pathlib import Path
+
+          sbom_path = Path(sys.argv[1])
+          out_path = Path(sys.argv[2])
+
+          try:
+              data = json.loads(sbom_path.read_text())
+              required = ["spdxVersion", "SPDXID", "name", "creationInfo", "packages"]
+              missing = [key for key in required if key not in data]
+
+              lines = []
+              lines.append(f"File: {sbom_path}")
+              lines.append("Validation type: basic SPDX JSON structure check")
+              lines.append(f"SPDX version: {data.get('spdxVersion', 'missing')}")
+              lines.append(f"Packages: {len(data.get('packages', []))}")
+
+              if missing:
+                  lines.append(f"Status: failed")
+                  lines.append(f"Missing required fields: {', '.join(missing)}")
+              else:
+                  lines.append("Status: success")
+
+              out_path.write_text("\n".join(lines) + "\n")
+              print(out_path.read_text())
+              sys.exit(1 if missing else 0)
+          except Exception as exc:
+              out_path.write_text(f"Status: failed\nReason: {exc}\n")
+              print(out_path.read_text())
+              sys.exit(1)
+          PY
+
       - name: Assess source SPDX SBOM quality with sbomqs
+        if: always()
+        continue-on-error: true
         run: |
           mkdir -p "$QUALITY_DIR"
 
-          sbomqs score "$SBOM_DIR/source/helm.source.syft.spdx.json" \
-            2>&1 | tee "$QUALITY_DIR/source-sbomqs-score.txt" || true
+          if [ -f "$SBOM_DIR/source/helm.source.syft.spdx.json" ]; then
+            sbomqs score "$SBOM_DIR/source/helm.source.syft.spdx.json" \
+              2>&1 | tee "$QUALITY_DIR/source-sbomqs-score.txt" || true
 
-          sbomqs score "$SBOM_DIR/source/helm.source.syft.spdx.json" --json \
-            > "$QUALITY_DIR/source-sbomqs-score.json" || true
+            sbomqs score "$SBOM_DIR/source/helm.source.syft.spdx.json" --json \
+              > "$QUALITY_DIR/source-sbomqs-score.json" || true
+          else
+            echo "Source SPDX SBOM not found. Skipping quality assessment." | tee "$QUALITY_DIR/source-sbomqs-score.txt"
+          fi
 
       - name: Assess artifact SPDX SBOM quality with sbomqs
         if: always()
+        continue-on-error: true
         run: |
           mkdir -p "$QUALITY_DIR"
 
@@ -366,13 +484,16 @@ jobs:
           fi
 
       - name: Assess SPDX SBOM quality with sbom-scorecard
+        if: always()
         continue-on-error: true
         run: |
           mkdir -p "$QUALITY_DIR"
 
           if command -v sbom-scorecard >/dev/null 2>&1; then
-            sbom-scorecard "$SBOM_DIR/source/helm.source.syft.spdx.json" \
-              2>&1 | tee "$QUALITY_DIR/source-sbom-scorecard.txt" || true
+            if [ -f "$SBOM_DIR/source/helm.source.syft.spdx.json" ]; then
+              sbom-scorecard "$SBOM_DIR/source/helm.source.syft.spdx.json" \
+                2>&1 | tee "$QUALITY_DIR/source-sbom-scorecard.txt" || true
+            fi
 
             if [ -f "$SBOM_DIR/artifacts/helm.artifacts.syft.spdx.json" ]; then
               sbom-scorecard "$SBOM_DIR/artifacts/helm.artifacts.syft.spdx.json" \
@@ -383,7 +504,10 @@ jobs:
           fi
 
       - name: Generate GitHub artifact attestation
+        if: always()
         continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           mkdir -p "$SIGNING_DIR"
 
@@ -397,6 +521,7 @@ jobs:
           fi
 
       - name: Sign SPDX SBOM with Cosign keyless
+        if: always()
         continue-on-error: true
         env:
           COSIGN_EXPERIMENTAL: "true"
@@ -406,22 +531,26 @@ jobs:
           SOURCE_SBOM="$SBOM_DIR/source/helm.source.syft.spdx.json"
           ARTIFACT_SBOM="$SBOM_DIR/artifacts/helm.artifacts.syft.spdx.json"
 
-          if [ -f "$SOURCE_SBOM" ]; then
-            cosign sign-blob "$SOURCE_SBOM" \
-              --yes \
-              --bundle "$SIGNING_DIR/helm.source.syft.spdx.bundle.json" \
-              2>&1 | tee "$SIGNING_DIR/source-cosign-sign.log" || true
-          else
-            echo "Source SPDX SBOM not found. Skipping source signing." | tee "$SIGNING_DIR/source-cosign-sign.log"
-          fi
+          if command -v cosign >/dev/null 2>&1; then
+            if [ -f "$SOURCE_SBOM" ]; then
+              cosign sign-blob "$SOURCE_SBOM" \
+                --yes \
+                --bundle "$SIGNING_DIR/helm.source.syft.spdx.bundle.json" \
+                2>&1 | tee "$SIGNING_DIR/source-cosign-sign.log" || true
+            else
+              echo "Source SPDX SBOM not found. Skipping source signing." | tee "$SIGNING_DIR/source-cosign-sign.log"
+            fi
 
-          if [ -f "$ARTIFACT_SBOM" ]; then
-            cosign sign-blob "$ARTIFACT_SBOM" \
-              --yes \
-              --bundle "$SIGNING_DIR/helm.artifacts.syft.spdx.bundle.json" \
-              2>&1 | tee "$SIGNING_DIR/artifact-cosign-sign.log" || true
+            if [ -f "$ARTIFACT_SBOM" ]; then
+              cosign sign-blob "$ARTIFACT_SBOM" \
+                --yes \
+                --bundle "$SIGNING_DIR/helm.artifacts.syft.spdx.bundle.json" \
+                2>&1 | tee "$SIGNING_DIR/artifact-cosign-sign.log" || true
+            else
+              echo "Artifact SPDX SBOM not found. Skipping artifact signing." | tee "$SIGNING_DIR/artifact-cosign-sign.log"
+            fi
           else
-            echo "Artifact SPDX SBOM not found. Skipping artifact signing." | tee "$SIGNING_DIR/artifact-cosign-sign.log"
+            echo "Cosign command not available. Skipping signing." | tee "$SIGNING_DIR/cosign-status.log"
           fi
 
       - name: Record FOSSology review status
@@ -480,10 +609,10 @@ jobs:
             exit 0
           fi
 
-          echo "sbomify upload is configured but endpoint details may depend on the target sbomify setup." \
+          echo "sbomify upload is configured but endpoint details depend on the target sbomify setup." \
             | tee "$REVIEW_DIR/sbomify/sbomify-upload.log"
 
-          echo '{"status":"configured","reason":"sbomify secrets detected; implement organization-specific upload endpoint if required"}' \
+          echo '{"status":"configured","reason":"sbomify secrets detected; organization-specific upload endpoint can be added"}' \
             > "$REVIEW_DIR/sbomify/sbomify-status.json"
 
       - name: Produce OpenVEX document
@@ -508,7 +637,8 @@ jobs:
               "version": 1,
               "statements": [],
               "metadata": {
-                "note": "OpenVEX placeholder for SPDX workflow. No vulnerability scanner is part of this SPDX-focused license compliance workflow stage."
+                "product": $product,
+                "note": "OpenVEX placeholder for SPDX workflow. This SPDX-focused workflow is centered on SBOM generation, validation, quality, storage, license review and tracking."
               }
             }' > "$VEX_DIR/helm.openvex.json"
 
@@ -575,7 +705,7 @@ jobs:
                 ],
                 artifact_sbom_generation: "Syft",
                 schema_validation: [
-                  "SPDX tools / pyspdxtools",
+                  "SPDX tools / basic SPDX JSON structure check",
                   "NTIA conformance checker"
                 ],
                 quality_assessment: [
@@ -631,7 +761,7 @@ jobs:
             echo "- SBOM generation: bom"
             echo "- SBOM generation: spdx-sbom-generator"
             echo "- SBOM generation: GitHub SBOM export if available"
-            echo "- SBOM validation: SPDX tools / pyspdxtools"
+            echo "- SBOM validation: SPDX tools / basic SPDX JSON structure check"
             echo "- SBOM validation: NTIA conformance checker"
             echo "- SBOM quality assessment: sbomqs"
             echo "- SBOM quality assessment: sbom-scorecard"
