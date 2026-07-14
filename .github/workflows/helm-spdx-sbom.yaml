@@ -572,33 +572,68 @@ jobs:
 
           cat "$STATUS_FILE"
 
-      - name: Record FOSSology review status
+      - name: Record FOSSology stage status
         if: always()
         run: |
           mkdir -p "$REVIEW_DIR/fossology"
 
           {
-            echo "# FOSSology review status"
+            echo "# FOSSology status"
             echo
-            echo "FOSSology is included in the SPDX reference workflow as the license compliance review tool."
+            echo "FOSSology is included in SPDX workflow stage 6 as the license compliance review and decision-history system."
             echo
-            echo "This CI workflow generated SPDX SBOM artifacts that can be imported into FOSSology for manual or centralized license review."
+            echo "Current status: pending configuration."
             echo
-            echo "Automated FOSSology upload is not executed here because it requires a configured FOSSology server and API credentials."
+            echo "Reason: FOSSology requires a reachable server, API token and folder ID."
             echo
-            echo "Primary input SBOM:"
+            echo "Required future secrets:"
+            echo "- FOSSOLOGY_URL"
+            echo "- FOSSOLOGY_TOKEN"
+            echo "- FOSSOLOGY_FOLDER_ID"
+            echo
+            echo "Prepared input files:"
             echo "- $SBOM_DIR/source/helm.source.syft.spdx.json"
-            echo
-            echo "Artifact SBOM:"
             echo "- $SBOM_DIR/artifacts/helm.artifacts.syft.spdx.json"
-          } > "$REVIEW_DIR/fossology/fossology-review-status.md"
+          } > "$REVIEW_DIR/fossology/fossology-stage-status.md"
 
-          echo '{"status":"prepared","tool":"FOSSology","reason":"SBOMs generated for external license compliance review"}' \
+          jq -n \
+            --arg status "pending_configuration" \
+            --arg tool "FOSSology" \
+            --arg reason "FOSSology server/API configuration not provided yet; sbomify integration is being tested first" \
+            '{status:$status, tool:$tool, reason:$reason}' \
             > "$REVIEW_DIR/fossology/fossology-review-status.json"
 
-          cat "$REVIEW_DIR/fossology/fossology-review-status.md"
+          cat "$REVIEW_DIR/fossology/fossology-stage-status.md"
+          cat "$REVIEW_DIR/fossology/fossology-review-status.json"
 
-      - name: Upload SPDX SBOM to sbomify if configured
+      - name: Prepare sbomify metadata
+        if: always()
+        run: |
+          mkdir -p "$REVIEW_DIR/sbomify"
+
+          cat > sbomify.json <<JSON
+          {
+            "lifecycle_phase": "build",
+            "supplier": {
+              "name": "Helm Project",
+              "url": ["https://github.com/helm/helm"]
+            },
+            "authors": [
+              {
+                "name": "GitHub Actions SPDX SBOM workflow"
+              }
+            ],
+            "licenses": ["Apache-2.0"],
+            "vcs_url": "https://github.com/helm/helm",
+            "vcs_commit_sha": "$HELM_REF",
+            "vcs_ref": "$HELM_REF"
+          }
+          JSON
+
+          cp sbomify.json "$REVIEW_DIR/sbomify/sbomify.json"
+          cat "$REVIEW_DIR/sbomify/sbomify.json"
+
+      - name: Require sbomify configuration
         if: always()
         env:
           SBOMIFY_TOKEN: ${{ secrets.SBOMIFY_TOKEN }}
@@ -606,33 +641,82 @@ jobs:
         run: |
           mkdir -p "$REVIEW_DIR/sbomify"
 
-          SBOM_FILE="$SBOM_DIR/source/helm.source.syft.spdx.json"
+          STATUS_FILE="$REVIEW_DIR/sbomify/sbomify-status.json"
 
           if [ -z "$SBOMIFY_TOKEN" ] || [ -z "$SBOMIFY_COMPONENT_ID" ]; then
             {
-              echo "sbomify token or component ID is not configured. Skipping upload."
-              echo
-              echo "Required secrets:"
+              echo "sbomify is required by SPDX workflow stage 6."
+              echo "Missing required repository secrets:"
               echo "- SBOMIFY_TOKEN"
               echo "- SBOMIFY_COMPONENT_ID"
-            } | tee "$REVIEW_DIR/sbomify/sbomify-upload.log"
+              echo
+              echo "Your current sbomify component ID should be stored as SBOMIFY_COMPONENT_ID."
+            } | tee "$REVIEW_DIR/sbomify/sbomify-required.log"
 
-            echo '{"status":"skipped","reason":"SBOMIFY_TOKEN or SBOMIFY_COMPONENT_ID not configured"}' \
-              > "$REVIEW_DIR/sbomify/sbomify-status.json"
-            exit 0
+            jq -n \
+              --arg status "failed" \
+              --arg tool "sbomify" \
+              --arg reason "SBOMIFY_TOKEN or SBOMIFY_COMPONENT_ID is not configured" \
+              '{status:$status, tool:$tool, reason:$reason}' \
+              > "$STATUS_FILE"
+
+            cat "$STATUS_FILE"
+            exit 1
           fi
 
-          if [ ! -f "$SBOM_FILE" ]; then
-            echo "SPDX SBOM not found. Skipping sbomify upload." | tee "$REVIEW_DIR/sbomify/sbomify-upload.log"
-            echo '{"status":"skipped","reason":"SPDX SBOM not found"}' > "$REVIEW_DIR/sbomify/sbomify-status.json"
-            exit 0
+          echo "::add-mask::$SBOMIFY_TOKEN"
+          echo "sbomify configuration is available." | tee "$REVIEW_DIR/sbomify/sbomify-required.log"
+
+      - name: Upload source SPDX SBOM to sbomify
+        if: always()
+        uses: sbomify/sbomify-action@master
+        env:
+          TOKEN: ${{ secrets.SBOMIFY_TOKEN }}
+          COMPONENT_ID: ${{ secrets.SBOMIFY_COMPONENT_ID }}
+          COMPONENT_NAME: Helm
+          COMPONENT_VERSION: ${{ env.HELM_VERSION }}
+          COMPONENT_PURL: pkg:github/helm/helm@${{ env.HELM_VERSION }}
+          SBOM_FILE: ${{ github.workspace }}/sbom/helm/source/helm.source.syft.spdx.json
+          OUTPUT_FILE: ${{ github.workspace }}/review-results/helm/sbomify/helm.source.sbomify.enriched.spdx.json
+          SBOM_FORMAT: spdx
+          UPLOAD: true
+          UPLOAD_DESTINATIONS: sbomify
+          AUGMENT: true
+          ENRICH: true
+
+      - name: Record sbomify upload status
+        if: always()
+        run: |
+          mkdir -p "$REVIEW_DIR/sbomify"
+
+          STATUS_FILE="$REVIEW_DIR/sbomify/sbomify-status.json"
+          OUTPUT_FILE="$REVIEW_DIR/sbomify/helm.source.sbomify.enriched.spdx.json"
+
+          if [ -f "$OUTPUT_FILE" ] && jq -e '.spdxVersion and .packages' "$OUTPUT_FILE" >/dev/null 2>&1; then
+            PACKAGE_COUNT="$(jq '.packages | length' "$OUTPUT_FILE")"
+
+            jq -n \
+              --arg status "success" \
+              --arg tool "sbomify" \
+              --arg sbom "$OUTPUT_FILE" \
+              --arg component "Helm" \
+              --arg version "$HELM_VERSION" \
+              --argjson packages "$PACKAGE_COUNT" \
+              '{status:$status, tool:$tool, sbom:$sbom, component:$component, version:$version, packages:$packages}' \
+              > "$STATUS_FILE"
+          else
+            jq -n \
+              --arg status "failed" \
+              --arg tool "sbomify" \
+              --arg reason "sbomify action did not produce a valid enriched SPDX SBOM output" \
+              '{status:$status, tool:$tool, reason:$reason}' \
+              > "$STATUS_FILE"
+
+            cat "$STATUS_FILE"
+            exit 1
           fi
 
-          echo "sbomify upload is configured but endpoint details depend on the target sbomify setup." \
-            | tee "$REVIEW_DIR/sbomify/sbomify-upload.log"
-
-          echo '{"status":"configured","reason":"sbomify secrets detected; organization-specific upload endpoint can be added"}' \
-            > "$REVIEW_DIR/sbomify/sbomify-status.json"
+          cat "$STATUS_FILE"
 
       - name: Produce OpenVEX document
         if: always()
@@ -749,7 +833,7 @@ jobs:
                 attestation: "actions/attest@v4 SBOM attestation for Helm binary",
                 signing: ["Cosign", "Sigstore keyless"],
                 artifact_storage: "actions/upload-artifact@v4",
-                review_and_tracking: ["FOSSology review preparation", "sbomify optional integration"],
+                review_and_tracking: ["FOSSology stage recorded pending configuration", "sbomify upload/enrichment/tracking"],
                 vex: ["OpenVEX placeholder", "CSAF VEX status placeholder"]
               },
               artifacts: {
@@ -795,7 +879,7 @@ jobs:
             echo
             echo "## Lifecycle stage"
             echo
-            echo "Current milestone: build + SPDX SBOM generation + SPDX validation + quality assessment + attestation/signing + artifact storage + license review/tracking preparation + VEX placeholder"
+            echo "Current milestone: build + SPDX SBOM generation + SPDX validation + quality assessment + attestation/signing + artifact storage + sbomify tracking + VEX placeholder"
             echo
             echo "## Tool status overview"
             echo
@@ -805,8 +889,8 @@ jobs:
             status_line "sbom-scorecard" "$QUALITY_DIR/sbom-scorecard-status.json"
             status_line "GitHub SBOM attestation" "$SIGNING_DIR/github-attestation-status.json"
             status_line "Cosign signing" "$SIGNING_DIR/cosign-status.json"
-            status_line "FOSSology review preparation" "$REVIEW_DIR/fossology/fossology-review-status.json"
-            status_line "sbomify upload" "$REVIEW_DIR/sbomify/sbomify-status.json"
+            status_line "FOSSology stage" "$REVIEW_DIR/fossology/fossology-review-status.json"
+            status_line "sbomify upload/enrichment/tracking" "$REVIEW_DIR/sbomify/sbomify-status.json"
             status_line "CSAF VEX status" "$VEX_DIR/csaf-vex-status.json"
             echo
             echo "## Tooling"
@@ -824,11 +908,11 @@ jobs:
             echo "- Attestation: actions/attest@v4"
             echo "- Signing: Cosign / Sigstore keyless"
             echo "- Artifact storage: actions/upload-artifact@v4"
-            echo "- Store, review and track: FOSSology review preparation"
-            echo "- Store, review and track: sbomify optional integration"
+            echo "- Store, review and track: sbomify upload, enrichment and tracking"
+            echo "- Store, review and track: FOSSology stage recorded as pending configuration"
             echo "- VEX: OpenVEX placeholder and CSAF VEX status"
             echo "- SBOM standard: SPDX"
-            echo "- Output format: JSON for Syft/GitHub/spdx-sbom-generator, tag-value for bom"
+            echo "- Output format: JSON for Syft/GitHub/spdx-sbom-generator/sbomify, tag-value for bom"
             echo
             for section in \
               "Generated source SBOM files:$SBOM_DIR/source" \
