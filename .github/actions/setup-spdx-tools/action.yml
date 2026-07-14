@@ -1,0 +1,151 @@
+name: Setup SPDX Workflow Tools
+description: Install base packages and SPDX/SBOM tools used by the Helm SPDX workflow.
+
+runs:
+  using: composite
+  steps:
+    - name: Install base OS tools and create output directories
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        sudo apt-get update
+        sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+          jq unzip zip make rsync curl wget git ca-certificates
+
+        mkdir -p \
+          "$SBOM_DIR/source" \
+          "$SBOM_DIR/artifacts" \
+          "$BUILD_LOG_DIR" \
+          "$VALIDATION_DIR" \
+          "$QUALITY_DIR" \
+          "$REVIEW_DIR/fossology" \
+          "$REVIEW_DIR/sbomify" \
+          "$SIGNING_DIR" \
+          "$VEX_DIR" \
+          "$ARTIFACT_INPUT_DIR"
+
+    - name: Record runtime versions
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        {
+          echo "Go:"
+          go version
+          echo
+          echo "Python:"
+          python --version
+          echo
+          echo "Node:"
+          node --version
+          echo
+          echo "NPM:"
+          npm --version
+          echo
+          echo "GitHub CLI:"
+          gh --version || true
+        } | tee "$BUILD_LOG_DIR/runtime-versions.txt"
+
+    - name: Install Syft
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh \
+          | sudo sh -s -- -b /usr/local/bin
+        syft version | tee "$BUILD_LOG_DIR/syft-version.txt"
+
+    - name: Install bom
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        set +e
+        go install sigs.k8s.io/bom/cmd/bom@latest
+        BOM_INSTALL_EXIT=$?
+        set -e
+
+        if [ "$BOM_INSTALL_EXIT" -eq 0 ] && [ -x "$HOME/go/bin/bom" ]; then
+          sudo cp "$HOME/go/bin/bom" /usr/local/bin/bom
+          bom version 2>&1 | tee "$BUILD_LOG_DIR/bom-version.txt" || true
+          echo '{"status":"success","method":"go install"}' > "$BUILD_LOG_DIR/bom-install-status.json"
+        else
+          echo "bom installation failed. Syft remains the primary SPDX generator." | tee "$BUILD_LOG_DIR/bom-version.txt"
+          echo '{"status":"failed","reason":"go install failed; Syft remains the primary SPDX generator"}' > "$BUILD_LOG_DIR/bom-install-status.json"
+        fi
+
+    - name: Install spdx-sbom-generator
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        set +e
+        go install github.com/opensbom-generator/spdx-sbom-generator@latest
+        GENERATOR_INSTALL_EXIT=$?
+        set -e
+
+        if [ "$GENERATOR_INSTALL_EXIT" -eq 0 ] && [ -x "$HOME/go/bin/spdx-sbom-generator" ]; then
+          sudo cp "$HOME/go/bin/spdx-sbom-generator" /usr/local/bin/spdx-sbom-generator
+          spdx-sbom-generator --version 2>&1 | tee "$BUILD_LOG_DIR/spdx-sbom-generator-version.txt" || true
+          echo '{"status":"success","method":"go install"}' > "$BUILD_LOG_DIR/spdx-sbom-generator-install-status.json"
+        else
+          echo "spdx-sbom-generator installation failed. Syft remains the primary SPDX generator." | tee "$BUILD_LOG_DIR/spdx-sbom-generator-version.txt"
+          echo '{"status":"failed","reason":"go install failed; Syft remains the primary SPDX generator"}' > "$BUILD_LOG_DIR/spdx-sbom-generator-install-status.json"
+        fi
+
+    - name: Install SPDX Python tools and NTIA checker
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        python -m pip install --upgrade pip
+        python -m pip install --user spdx-tools || true
+        python -m pip install --user ntia-conformance-checker || true
+        echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+        python -m pip freeze | grep -Ei "spdx|ntia" | tee "$BUILD_LOG_DIR/spdx-python-tools-version.txt" || true
+
+    - name: Install sbomqs
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        go install github.com/interlynk-io/sbomqs/v2@latest
+        sudo cp "$HOME/go/bin/sbomqs" /usr/local/bin/sbomqs
+        sbomqs version 2>&1 | tee "$BUILD_LOG_DIR/sbomqs-version.txt" || sbomqs --version 2>&1 | tee "$BUILD_LOG_DIR/sbomqs-version.txt" || true
+
+    - name: Install sbom-scorecard
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        npm install -g sbom-scorecard || true
+        sbom-scorecard --version 2>&1 | tee "$BUILD_LOG_DIR/sbom-scorecard-version.txt" || true
+
+    - name: Install Cosign
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        curl -sSfL https://raw.githubusercontent.com/sigstore/cosign/main/install.sh \
+          | sudo sh -s -- -b /usr/local/bin || true
+        cosign version 2>&1 | tee "$BUILD_LOG_DIR/cosign-version.txt" || true
+
+    - name: Install vexctl
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        go install github.com/openvex/vexctl@latest || true
+        if [ -x "$HOME/go/bin/vexctl" ]; then
+          sudo cp "$HOME/go/bin/vexctl" /usr/local/bin/vexctl
+        fi
+        vexctl version 2>&1 | tee "$BUILD_LOG_DIR/vexctl-version.txt" || true
+
+    - name: Install CSAF tools
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        npm install -g @csaf/csaf-validator-lib @csaf/csaf-cli || true
+        csaf --version 2>&1 | tee "$BUILD_LOG_DIR/csaf-version.txt" || true
